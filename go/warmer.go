@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -21,7 +20,10 @@ const (
 	pluginID       = "codex-5h-quota-warmer"
 	pluginName     = "Codex Five-Hour Quota Warmer"
 	pluginVersion  = "0.2.0"
-	maxLogsDefault = 200
+	maxLogsDefault    = 200
+	maxSchedules      = 48
+	maxCredentials    = 1000
+	manualRunInterval = time.Minute
 )
 
 var globalWarmer = newWarmer()
@@ -49,7 +51,8 @@ type scheduledRun struct {
 }
 
 type warmResult struct {
-	AuthID     string `json:"auth_id"`
+	CredentialNumber int `json:"credential_number,omitempty"`
+	AuthID     string `json:"auth_id,omitempty"`
 	Label      string `json:"label,omitempty"`
 	Model      string `json:"model"`
 	StatusCode int    `json:"status_code,omitempty"`
@@ -142,6 +145,7 @@ type warmer struct {
 	done        chan struct{}
 	planned     scheduledRun
 	running     bool
+	lastManualStart time.Time
 	lastRun     time.Time
 	lastSource  string
 	lastResults []warmResult
@@ -171,22 +175,25 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		return cfg, nil
 	}
 	if errUnmarshal := yaml.Unmarshal(raw, &cfg); errUnmarshal != nil {
-		return pluginConfig{}, fmt.Errorf("decode plugin configuration: %w", errUnmarshal)
+		return pluginConfig{}, fmt.Errorf("invalid plugin configuration YAML")
 	}
 	cfg.Model = strings.TrimSpace(cfg.Model)
-	if cfg.Model == "" {
-		return pluginConfig{}, fmt.Errorf("model is required")
+	if cfg.Model == "" || len(cfg.Model) > 256 {
+		return pluginConfig{}, fmt.Errorf("model must contain 1 to 256 bytes")
 	}
 	cfg.Prompt = strings.TrimSpace(cfg.Prompt)
-	if cfg.Prompt == "" {
-		return pluginConfig{}, fmt.Errorf("prompt is required")
+	if cfg.Prompt == "" || len(cfg.Prompt) > 4096 {
+		return pluginConfig{}, fmt.Errorf("prompt must contain 1 to 4096 bytes")
 	}
 	cfg.Timezone = strings.TrimSpace(cfg.Timezone)
 	if cfg.Timezone == "" {
 		cfg.Timezone = "Asia/Singapore"
 	}
+	if len(cfg.Timezone) > 128 {
+		return pluginConfig{}, fmt.Errorf("timezone exceeds length limit")
+	}
 	if _, errLocation := time.LoadLocation(cfg.Timezone); errLocation != nil {
-		return pluginConfig{}, fmt.Errorf("timezone %q is invalid: %w", cfg.Timezone, errLocation)
+		return pluginConfig{}, fmt.Errorf("invalid timezone")
 	}
 	if cfg.MaxLogEntries <= 0 {
 		cfg.MaxLogEntries = maxLogsDefault
@@ -198,28 +205,33 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	if cfg.StateFile == "" {
 		cfg.StateFile = defaultStateFile()
 	}
-	stateFile, errPath := filepath.Abs(cfg.StateFile)
+	stateFile, errPath := secureStatePath(cfg.StateFile)
 	if errPath != nil {
-		return pluginConfig{}, fmt.Errorf("resolve state_file: %w", errPath)
+		return pluginConfig{}, errPath
 	}
 	cfg.StateFile = stateFile
+	if len(cfg.Schedules) > maxSchedules {
+		return pluginConfig{}, fmt.Errorf("too many schedules (maximum %d)", maxSchedules)
+	}
 	seen := make(map[string]struct{}, len(cfg.Schedules))
 	seenTimes := make(map[string]struct{}, len(cfg.Schedules))
 	for index := range cfg.Schedules {
 		item := &cfg.Schedules[index]
 		item.ID = strings.TrimSpace(item.ID)
 		item.At = strings.TrimSpace(item.At)
-		if item.ID == "" {
-			return pluginConfig{}, fmt.Errorf("schedules[%d].id is required", index)
+		if item.ID == "" || len(item.ID) > 64 {
+			return pluginConfig{}, fmt.Errorf("schedules[%d].id must contain 1 to 64 bytes", index)
 		}
 		if item.At == "" {
 			return pluginConfig{}, fmt.Errorf("schedules[%d].at is required", index)
 		}
-		if _, errParse := time.Parse("15:04", item.At); errParse != nil {
-			return pluginConfig{}, fmt.Errorf("schedules[%d].at must use HH:MM: %w", index, errParse)
+		parsed, errParse := time.Parse("15:04", item.At)
+		if errParse != nil {
+			return pluginConfig{}, fmt.Errorf("schedules[%d].at must use HH:MM", index)
 		}
+		item.At = parsed.Format("15:04")
 		if _, duplicate := seen[item.ID]; duplicate {
-			return pluginConfig{}, fmt.Errorf("schedule id %q is duplicated", item.ID)
+			return pluginConfig{}, fmt.Errorf("duplicate schedule ID at index %d", index)
 		}
 		seen[item.ID] = struct{}{}
 		if scheduleEnabled(*item) {
@@ -252,7 +264,7 @@ func (w *warmer) Configure(cfg pluginConfig) {
 		w.stateLocked = errLoad != nil
 		w.stateError = ""
 		if errLoad != nil {
-			w.stateError = errLoad.Error()
+			w.stateError = "Unable to load warm-up history"
 		} else if loaded {
 			w.lastRun = state.LastRun
 			w.lastSource = state.LastSource
@@ -391,6 +403,13 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 		w.mu.Unlock()
 		return nil, &hostCallError{code: "plugin_disabled", message: "the plugin is disabled", httpStatus: http.StatusConflict}
 	}
+	if source == "manual" {
+		if !w.lastManualStart.IsZero() && time.Since(w.lastManualStart) < manualRunInterval {
+			w.mu.Unlock()
+			return nil, &hostCallError{code: "manual_rate_limited", message: "manual warm-up may be started once per minute", httpStatus: http.StatusTooManyRequests}
+		}
+		w.lastManualStart = time.Now()
+	}
 	w.running = true
 	w.lastSource = source
 	w.mu.Unlock()
@@ -428,8 +447,9 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 	}
 	results := make([]warmResult, 0, len(auths))
 	successCount := 0
-	for _, auth := range auths {
+	for index, auth := range auths {
 		result := warmOneCredential(cfg, auth)
+		result.CredentialNumber = index + 1
 		results = append(results, result)
 		level := "info"
 		message := "Codex credential warm-up completed"
@@ -441,8 +461,7 @@ func (w *warmer) Run(source string) ([]warmResult, error) {
 		}
 		w.recordLog(level, "warmup.credential", message, map[string]any{
 			"source":      source,
-			"auth_id":     result.AuthID,
-			"label":       result.Label,
+			"credential_number": result.CredentialNumber,
 			"model":       result.Model,
 			"status_code": result.StatusCode,
 			"error":       result.Error,
@@ -471,7 +490,7 @@ func listCodexAuths() ([]pluginapi.HostAuthFileEntry, authSelection, error) {
 	}
 	var response authListResponse
 	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
-		return nil, authSelection{}, fmt.Errorf("decode host.auth.list response: %w", errUnmarshal)
+		return nil, authSelection{}, fmt.Errorf("decode credential list failed")
 	}
 	selection := authSelection{Total: len(response.Files)}
 	auths := make([]pluginapi.HostAuthFileEntry, 0, len(response.Files))
@@ -494,6 +513,9 @@ func listCodexAuths() ([]pluginapi.HostAuthFileEntry, authSelection, error) {
 		if !strings.EqualFold(strings.TrimSpace(auth.Status), "active") {
 			selection.Inactive++
 		}
+		if len(auths) >= maxCredentials {
+			return nil, selection, fmt.Errorf("credential count exceeds safe limit")
+		}
 		auths = append(auths, auth)
 	}
 	sort.Slice(auths, func(i, j int) bool {
@@ -513,7 +535,7 @@ func warmOneCredential(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) warmR
 		"stream": false,
 	})
 	if errBody != nil {
-		result.Error = errBody.Error()
+		result.Error = "Unable to encode warm-up request"
 		return result
 	}
 	raw, errCall := callHost(pluginabi.MethodHostModelExecute, pluginapi.HostModelExecutionRequest{
@@ -527,7 +549,7 @@ func warmOneCredential(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) warmR
 		AuthID:         auth.ID,
 	})
 	if errCall != nil {
-		result.Error = errCall.Error()
+		result.Error = "Model execution failed"
 		var statusCoder interface{ StatusCode() int }
 		if errors.As(errCall, &statusCoder) && statusCoder != nil {
 			result.StatusCode = statusCoder.StatusCode()
@@ -536,7 +558,7 @@ func warmOneCredential(cfg pluginConfig, auth pluginapi.HostAuthFileEntry) warmR
 	}
 	var response pluginapi.HostModelExecutionResponse
 	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
-		result.Error = fmt.Sprintf("decode host.model.execute response: %v", errUnmarshal)
+		result.Error = "Unable to decode model execution response"
 		return result
 	}
 	result.StatusCode = response.StatusCode
@@ -621,26 +643,9 @@ func (w *warmer) recordLog(level, event, message string, fields map[string]any) 
 	hostFields["plugin_id"] = pluginID
 	_, _ = callHost(pluginabi.MethodHostLog, map[string]any{
 		"level":   level,
-		"message": hostLogMessage(event, message, fields),
+		"message": message,
 		"fields":  hostFields,
 	})
-}
-
-func hostLogMessage(event, message string, fields map[string]any) string {
-	switch event {
-	case "schedule.planned":
-		return fmt.Sprintf("%s schedule_id=%q scheduled_at=%v", message, fields["schedule_id"], fields["scheduled_at"])
-	case "schedule.triggered":
-		return fmt.Sprintf("%s source=%q scheduled_at=%v", message, fields["source"], fields["scheduled_at"])
-	case "warmup.selection":
-		return fmt.Sprintf("%s source=%q auth_total=%v codex_total=%v selected=%v skipped_disabled=%v reported_unavailable=%v reported_inactive=%v skipped_missing_id=%v", message, fields["source"], fields["auth_total"], fields["codex_total"], fields["selected_count"], fields["skipped_disabled"], fields["reported_unavailable"], fields["reported_inactive"], fields["skipped_missing_id"])
-	case "warmup.finished":
-		return fmt.Sprintf("%s source=%q credential_count=%v success_count=%v failure_count=%v", message, fields["source"], fields["credential_count"], fields["success_count"], fields["failure_count"])
-	case "warmup.started", "warmup.no_credentials", "warmup.auth_list_failed", "warmup.credential", "schedule.failed":
-		return fmt.Sprintf("%s source=%q", message, fields["source"])
-	default:
-		return message
-	}
 }
 
 func (w *warmer) appendLogLocked(level, event, message string, fields map[string]any) {
@@ -661,18 +666,38 @@ func (w *warmer) appendLogLocked(level, event, message string, fields map[string
 	}
 }
 
+// Only allow known operational fields. Never log arbitrary strings or credential identifiers.
 func sanitizeLogFields(fields map[string]any) map[string]any {
 	if len(fields) == 0 {
 		return nil
 	}
-	copyFields := make(map[string]any, len(fields))
+	out := make(map[string]any)
 	for key, value := range fields {
-		if strings.Contains(strings.ToLower(key), "token") || strings.Contains(strings.ToLower(key), "secret") || strings.Contains(strings.ToLower(key), "authorization") {
-			continue
+		switch key {
+		case "schedule_count", "auth_total", "codex_total", "selected_count", "skipped_disabled",
+			"reported_unavailable", "reported_inactive", "skipped_missing_id", "credential_count",
+			"success_count", "failure_count", "credential_number", "status_code":
+			switch value.(type) {
+			case int, float64:
+				out[key] = value
+			}
+		case "scheduled_at":
+			if v, ok := value.(string); ok {
+				if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+					out[key] = parsed.Format(time.RFC3339)
+				}
+			}
+		case "source":
+			if v, ok := value.(string); ok {
+				if v == "manual" {
+					out[key] = "manual"
+				} else if v == "schedule" || strings.HasPrefix(v, "schedule:") {
+					out[key] = "schedule"
+				}
+			}
 		}
-		copyFields[key] = value
 	}
-	return copyFields
+	return out
 }
 
 func cloneConfig(cfg pluginConfig) pluginConfig {
@@ -686,7 +711,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		var request lifecycleRequest
 		if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
-			return nil, fmt.Errorf("decode plugin lifecycle request: %w", errUnmarshal)
+			return nil, fmt.Errorf("invalid plugin lifecycle request")
 		}
 		cfg, errConfig := parsePluginConfig(request.ConfigYAML)
 		if errConfig != nil {
@@ -713,7 +738,7 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(raw)
 	default:
-		return errorEnvelope("unknown_method", "unknown method: "+method, 0), nil
+		return errorEnvelope("unknown_method", "unknown method", 0), nil
 	}
 }
 
@@ -741,18 +766,30 @@ func pluginRegistration() registration {
 func handleManagement(raw []byte) ([]byte, error) {
 	var request managementRequest
 	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode management request: %w", errUnmarshal)
+		return nil, fmt.Errorf("invalid management request")
 	}
-	path := strings.TrimRight(strings.TrimSpace(request.Path), "/")
-	switch {
-	case strings.HasSuffix(path, "/status"):
-		if strings.HasPrefix(path, "/v0/resource/") {
-			return okEnvelope(htmlResponse(http.StatusOK, []byte(statusPageHTML)))
+	const base = "/v0/management/plugins/" + pluginID
+	const resource = "/v0/resource/plugins/" + pluginID + "/status"
+	switch request.Path {
+	case resource:
+		if request.Method != http.MethodGet {
+			return methodNotAllowed(http.MethodGet)
+		}
+		return okEnvelope(htmlResponse(http.StatusOK, []byte(statusPageHTML)))
+	case base + "/status":
+		if request.Method != http.MethodGet {
+			return methodNotAllowed(http.MethodGet)
 		}
 		return okEnvelope(jsonResponse(http.StatusOK, globalWarmer.Status()))
-	case strings.HasSuffix(path, "/logs"):
+	case base + "/logs":
+		if request.Method != http.MethodGet {
+			return methodNotAllowed(http.MethodGet)
+		}
 		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"logs": globalWarmer.Logs()}))
-	case strings.HasSuffix(path, "/run"):
+	case base + "/run":
+		if request.Method != http.MethodPost {
+			return methodNotAllowed(http.MethodPost)
+		}
 		results, errRun := globalWarmer.Run("manual")
 		if errRun != nil {
 			status := http.StatusInternalServerError
@@ -768,6 +805,12 @@ func handleManagement(raw []byte) ([]byte, error) {
 	}
 }
 
+func methodNotAllowed(allowed string) ([]byte, error) {
+	response := jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	response.Headers.Set("Allow", allowed)
+	return okEnvelope(response)
+}
+
 func jsonResponse(status int, value any) managementResponse {
 	body, errMarshal := json.Marshal(value)
 	if errMarshal != nil {
@@ -776,7 +819,7 @@ func jsonResponse(status int, value any) managementResponse {
 	}
 	return managementResponse{
 		StatusCode: status,
-		Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
+		Headers:    securityHeaders("application/json; charset=utf-8"),
 		Body:       body,
 	}
 }
@@ -784,7 +827,16 @@ func jsonResponse(status int, value any) managementResponse {
 func htmlResponse(status int, body []byte) managementResponse {
 	return managementResponse{
 		StatusCode: status,
-		Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+		Headers:    securityHeaders("text/html; charset=utf-8"),
 		Body:       body,
+	}
+}
+
+func securityHeaders(contentType string) http.Header {
+	return http.Header{
+		"Content-Type":           {contentType},
+		"Cache-Control":          {"no-store"},
+		"X-Content-Type-Options": {"nosniff"},
+		"Referrer-Policy":        {"no-referrer"},
 	}
 }

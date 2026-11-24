@@ -63,6 +63,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
+const maxABIPayload = 32 << 20
+
 type envelope struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
@@ -121,6 +123,10 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required", 0))
+		return 1
+	}
+	if requestLen > C.size_t(maxABIPayload) || (request == nil && requestLen != 0) {
+		writeResponse(response, errorEnvelope("invalid_payload", "invalid request payload", 400))
 		return 1
 	}
 	var requestBytes []byte
@@ -200,11 +206,14 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 	}
 	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
 	var rawResponse []byte
+	if response.ptr != nil {
+		defer C.free_host_buffer(response.ptr, response.len)
+	}
+	if response.len > C.size_t(maxABIPayload) || (response.ptr == nil && response.len != 0) {
+		return nil, fmt.Errorf("host callback %s returned an invalid payload", method)
+	}
 	if response.ptr != nil && response.len > 0 {
 		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
-	}
-	if response.ptr != nil {
-		C.free_host_buffer(response.ptr, response.len)
 	}
 	if len(rawResponse) == 0 {
 		return nil, fmt.Errorf("host callback %s returned no response, code=%d", method, int(callCode))
@@ -212,13 +221,13 @@ func callHost(method string, payload any) (json.RawMessage, error) {
 
 	var responseEnvelope envelope
 	if errUnmarshal := json.Unmarshal(rawResponse, &responseEnvelope); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode host callback %s envelope: %w", method, errUnmarshal)
+		return nil, fmt.Errorf("decode host callback %s envelope failed", method)
 	}
 	if !responseEnvelope.OK {
 		if responseEnvelope.Error != nil {
 			return nil, &hostCallError{
-				code:       responseEnvelope.Error.Code,
-				message:    responseEnvelope.Error.Message,
+				code:       "host_callback_failed",
+				message:    "host callback failed",
 				httpStatus: responseEnvelope.Error.HTTPStatus,
 			}
 		}
