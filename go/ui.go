@@ -35,8 +35,8 @@ const statusPageHTML = `<!doctype html>
   <section class="card">
     <h2>管理密钥</h2>
     <div class="row">
-      <div class="field grow"><label for="management-key">管理密钥</label><input id="management-key" type="password" autocomplete="current-password" placeholder="用于读取状态、保存日程和手动执行"></div>
-      <label class="muted"><input id="remember-key" type="checkbox"> 在此浏览器保存管理密钥</label>
+      <div class="field grow"><label for="management-key">管理密钥</label><input id="management-key" type="password" autocomplete="off" placeholder="用于读取状态、保存日程和手动执行"></div>
+      
       <button id="reload" type="button" class="secondary">读取数据</button>
     </div>
     <p class="hint">页面资源不携带凭证数据；所有状态和操作均通过受管理密钥保护的接口完成。</p>
@@ -73,29 +73,27 @@ const statusPageHTML = `<!doctype html>
   const pluginID = "codex-5h-quota-warmer";
   const base = "/v0/management/plugins/" + pluginID;
   const elements = {
-    key: document.querySelector("#management-key"), remember: document.querySelector("#remember-key"), notice: document.querySelector("#notice"),
+    key: document.querySelector("#management-key"), notice: document.querySelector("#notice"),
     summary: document.querySelector("#summary"), nextRuns: document.querySelector("#next-runs"), results: document.querySelector("#last-results"),
     model: document.querySelector("#model"), timezone: document.querySelector("#timezone"), prompt: document.querySelector("#prompt"), maxLogs: document.querySelector("#max-logs"),
     schedules: document.querySelector("#schedules"), logs: document.querySelector("#logs"), runNow: document.querySelector("#run-now")
   };
   let configuration = null;
-  const storedKey = sessionStorage.getItem(pluginID + ".management-key") || localStorage.getItem(pluginID + ".management-key") || "";
-  elements.key.value = storedKey;
-  elements.remember.checked = Boolean(localStorage.getItem(pluginID + ".management-key"));
+  // Clear keys left by earlier versions; do not persist new credentials.
+  try { sessionStorage.removeItem(pluginID + ".management-key"); } catch (_) {}
+  try { localStorage.removeItem(pluginID + ".management-key"); } catch (_) {}
 
   function managementKey() { return elements.key.value.trim(); }
   function showNotice(text, type) { elements.notice.textContent = text || ""; elements.notice.className = "notice " + (type || ""); }
   function escapeText(value) { return String(value == null ? "" : value); }
   function formatTime(value) { if (!value || String(value).startsWith("0001-01-01")) return "—"; const date = new Date(value); return Number.isNaN(date.getTime()) ? escapeText(value) : date.toLocaleString(); }
-  function saveKey() { const key = managementKey(); sessionStorage.removeItem(pluginID + ".management-key"); localStorage.removeItem(pluginID + ".management-key"); if (!key) return; if (elements.remember.checked) localStorage.setItem(pluginID + ".management-key", key); else sessionStorage.setItem(pluginID + ".management-key", key); }
   async function request(path, options = {}) {
     const key = managementKey();
     if (!key) throw new Error("请输入管理密钥");
-    saveKey();
     const headers = new Headers(options.headers || {});
     headers.set("Authorization", "Bearer " + key);
     if (options.body) headers.set("Content-Type", "application/json");
-    const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+    const response = await fetch(path, { ...options, headers, credentials: "same-origin", redirect: "error", cache: "no-store" });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.message || payload.error || ("请求失败，HTTP " + response.status));
     return payload;
@@ -142,7 +140,7 @@ const statusPageHTML = `<!doctype html>
     elements.results.replaceChildren();
     if (!results.length) { elements.results.textContent = "暂无完成的预热记录。"; return; }
     const table = document.createElement("table"), head = document.createElement("thead"), header = document.createElement("tr"); ["凭证", "模型", "结果", "HTTP 状态", "错误"].forEach(value => { const node = document.createElement("th"); node.textContent = value; header.append(node); }); head.append(header); table.append(head);
-    const body = document.createElement("tbody"); results.forEach(result => { const row = document.createElement("tr"); row.append(cell(result.label || result.auth_id), cell(result.model), cell(result.success ? "成功" : "失败"), cell(result.status_code || "—"), cell(result.error || "—")); body.append(row); }); table.append(body); elements.results.append(table);
+    const body = document.createElement("tbody"); results.forEach(result => { const row = document.createElement("tr"); row.append(cell(result.label || result.auth_id || ("凭证 #" + (result.credential_number || "?"))), cell(result.model), cell(result.success ? "成功" : "失败"), cell(result.status_code || "—"), cell(result.error || "—")); body.append(row); }); table.append(body); elements.results.append(table);
   }
   function renderLogs(entries) {
     elements.logs.replaceChildren();
@@ -173,7 +171,7 @@ const statusPageHTML = `<!doctype html>
   async function loadLogs() { try { const payload = await request(base + "/logs"); renderLogs(payload.logs || []); } catch (error) { showNotice(error.message, "error"); } }
   document.querySelector("#reload").addEventListener("click", loadAll); document.querySelector("#run-now").addEventListener("click", runNow); document.querySelector("#save-settings").addEventListener("click", saveSettings); document.querySelector("#load-logs").addEventListener("click", loadLogs);
   document.querySelector("#add-schedule").addEventListener("click", () => { if (!configuration) configuration = { schedules: [] }; configuration.schedules = configuration.schedules || []; const now = new Date(); const at = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0"); configuration.schedules.push({ id: "daily-" + at.replace(":", ""), at, enabled: true }); renderSchedules(); });
-  if (managementKey()) loadAll();
+  elements.key.value = "";
 })();
 </script>
 </body>

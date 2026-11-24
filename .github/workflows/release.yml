@@ -1,7 +1,9 @@
 name: Release
 
 on:
+  pull_request:
   push:
+    branches: [main]
     tags:
       - 'v*'
 
@@ -15,16 +17,26 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
       - name: Check Go code
         working-directory: go
-        run: go vet ./...
+        run: |
+          go mod verify
+          go vet ./...
+          go test ./...
+          go build -trimpath -buildmode=c-shared -o /tmp/codex-5h-quota-warmer.so .
+      - name: Check Go vulnerabilities
+        working-directory: go
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
   build:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -40,14 +52,16 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
       - name: Set up MinGW
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
         with:
           msystem: MINGW64
           path-type: inherit
@@ -65,7 +79,7 @@ jobs:
           CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -buildmode=c-shared -ldflags='-s -w' -o "$library" .
           go run ../scripts/package.go -input "$library" -output "$archive"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.PLUGIN_ID }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -74,13 +88,14 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
